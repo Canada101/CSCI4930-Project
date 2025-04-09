@@ -4,6 +4,7 @@ import heapq
 import random
 from tqdm import tqdm
 
+# Constants from Simulation 1 in the paper
 SIMULATION_LIMIT = 1_000_000
 TRANSMISSION_TIME = 2
 LINK_AVAILABILITY = 0.9
@@ -31,13 +32,14 @@ class NetworkSimulator:
     def __init__(self, G, lam, ct, pbar):
         self.G = G
         self.lambda_rate = lam
-        self.congestion_threshold = ct
+        self.ct = ct
         self.pbar = pbar
-
         self.event_queue = []
         self.current_time = 0
 
-        self.queues = {node: {} for node in G.nodes()}
+        self.queues = {node: [] for node in G.nodes}  # Per-node FIFO queues
+        self.node_busy = {node: False for node in G.nodes}  # Transmission lock per node
+
         self.Nsucc = 0
         self.Ndrop = 0
         self.Ngen = 0
@@ -45,136 +47,163 @@ class NetworkSimulator:
         self.Nfail = 0
         self.Ngood = 0
 
-        self.max_gen = SIMULATION_LIMIT
+    def schedule_event(self, event):
+        heapq.heappush(self.event_queue, event)
 
     def initialize(self):
         for node in self.G.nodes:
             self.schedule_event(Event(0, GEN, node, None))
 
-    def schedule_event(self, event):
-        heapq.heappush(self.event_queue, event)
+    def is_congested(self, node):
+        return len(self.queues[node]) >= self.ct
 
     def is_link_available(self):
         return random.random() < LINK_AVAILABILITY
 
-    def is_congested(self, node, dst):
-        return len(self.queues[node].get(dst, [])) >= self.congestion_threshold
+    def enqueue_packet(self, node, packet):
+        self.queues[node].append(packet)
 
-    def enqueue_packet(self, node, dst, packet):
-        self.queues[node].setdefault(dst, []).append(packet)
-
-    def dequeue_packet(self, node, dst):
-        if self.queues[node].get(dst):
-            return self.queues[node][dst].pop(0)
-        return None
+    def dequeue_packet(self, node):
+        return self.queues[node].pop(0)
 
     def process_events(self):
-        last_progress = 0
+        completed = 0
         while self.event_queue:
-            if self.Ngen >= self.max_gen and (self.Nsucc + self.Ndrop) >= self.Ngen:
+            if (self.Nsucc + self.Ndrop) >= SIMULATION_LIMIT:
                 break
-
             event = heapq.heappop(self.event_queue)
             self.current_time = event.time
-
             if event.event_type == GEN:
-                if self.Ngen < self.max_gen:
-                    self.handle_gen(event)
+                self.handle_gen(event)
             elif event.event_type == TRANS:
                 self.handle_trans(event)
             elif event.event_type == RECEIVE:
                 self.handle_receive(event)
 
-            completed = self.Nsucc + self.Ndrop
-            if (completed - last_progress) >= 100:
-                self.pbar.update(completed - last_progress)
-                last_progress = completed
+            progress = self.Nsucc + self.Ndrop
+            if progress - completed >= 100:
+                self.pbar.update(progress - completed)
+                completed = progress
 
     def handle_gen(self, event):
-        src = event.node
-        dst = random.choice([n for n in self.G.nodes if n != src])
-
+        node = event.node
+        dst = random.choice([n for n in self.G.nodes if n != node])
         try:
-            path = nx.shortest_path(self.G, src, dst, weight='weight')
+            path = nx.shortest_path(self.G, node, dst)
         except nx.NetworkXNoPath:
             return
+        packet = Packet(node, dst, path)
 
-        packet = Packet(src, dst, path)
-        self.enqueue_packet(src, dst, packet)
-        self.schedule_event(Event(self.current_time, TRANS, src, packet))
+        if not self.is_congested(node):
+            self.enqueue_packet(node, packet)
+            if not self.node_busy[node]:
+                self.node_busy[node] = True
+                self.schedule_event(Event(self.current_time, TRANS, node, None))
+        else:
+            self.Ncong += 1
+            self.Ndrop += 1
 
-        inter_arrival = np.random.exponential(1 / self.lambda_rate)
-        self.schedule_event(Event(self.current_time + inter_arrival, GEN, src, None))
         self.Ngen += 1
+        interarrival = np.random.exponential(1 / self.lambda_rate)
+        self.schedule_event(Event(self.current_time + interarrival, GEN, node, None))
 
     def handle_trans(self, event):
         node = event.node
-        packet = event.packet
-        dst = packet.dst
-
+        if not self.queues[node]:
+            self.node_busy[node] = False
+            return
+        packet = self.dequeue_packet(node)
         path = packet.path
         hop = packet.current_hop
 
         if hop >= len(path) - 1:
+            self.node_busy[node] = False
             return
 
-        u, v = path[hop], path[hop + 1]
+        next_hop = path[hop + 1]
 
-        # Remove packet from the queue when transmitting
-        self.dequeue_packet(node, dst)
-
-        if self.is_congested(node, dst):
+        if self.is_congested(next_hop):
             self.Ncong += 1
             if not packet.rerouted:
+                packet.rerouted = True
                 try:
-                    alt_path = nx.shortest_path(self.G, node, dst, weight='weight')
-                    if alt_path != packet.path:
-                        packet.path = alt_path
+                    new_path = nx.shortest_path(self.G, node, packet.dst)
+                    if new_path != path:
+                        packet.path = new_path
                         packet.current_hop = 0
-                        packet.rerouted = True
-                        self.enqueue_packet(node, dst, packet)
-                        self.schedule_event(Event(self.current_time + TRANSMISSION_TIME, TRANS, node, packet))
+                        next_hop = new_path[1]
+                        if self.is_congested(next_hop):
+                            self.Ncong += 1
+                            self.Ndrop += 1
+                            self.node_busy[node] = False
+                            return
+                        if not self.is_link_available():
+                            self.Nfail += 1
+                            self.Ndrop += 1
+                            self.node_busy[node] = False
+                            return
+                        self.enqueue_packet(node, packet)
+                        self.schedule_event(Event(self.current_time + TRANSMISSION_TIME, TRANS, node, None))
                         return
-                except nx.NetworkXNoPath:
+                except:
                     pass
             self.Ndrop += 1
+            self.node_busy[node] = False
             return
 
         if not self.is_link_available():
             self.Nfail += 1
             if not packet.rerouted:
+                packet.rerouted = True
                 try:
-                    alt_path = nx.shortest_path(self.G, node, dst, weight='weight')
-                    if alt_path != packet.path:
-                        packet.path = alt_path
+                    new_path = nx.shortest_path(self.G, node, packet.dst)
+                    if new_path != path:
+                        packet.path = new_path
                         packet.current_hop = 0
-                        packet.rerouted = True
-                        self.enqueue_packet(node, dst, packet)
-                        self.schedule_event(Event(self.current_time + TRANSMISSION_TIME, TRANS, node, packet))
+                        next_hop = new_path[1]
+                        if self.is_congested(next_hop):
+                            self.Ncong += 1
+                            self.Ndrop += 1
+                            self.node_busy[node] = False
+                            return
+                        if not self.is_link_available():
+                            self.Nfail += 1
+                            self.Ndrop += 1
+                            self.node_busy[node] = False
+                            return
+                        self.enqueue_packet(node, packet)
+                        self.schedule_event(Event(self.current_time + TRANSMISSION_TIME, TRANS, node, None))
                         return
-                except nx.NetworkXNoPath:
+                except:
                     pass
             self.Ndrop += 1
+            self.node_busy[node] = False
             return
 
         self.Ngood += 1
-        self.schedule_event(Event(self.current_time + TRANSMISSION_TIME, RECEIVE, v, packet))
+        self.schedule_event(Event(self.current_time + TRANSMISSION_TIME, RECEIVE, next_hop, packet))
+        self.schedule_event(Event(self.current_time + TRANSMISSION_TIME, TRANS, node, None))
 
     def handle_receive(self, event):
         node = event.node
         packet = event.packet
-
         packet.current_hop += 1
 
         if node == packet.dst:
             self.Nsucc += 1
-        else:
-            self.enqueue_packet(node, packet.dst, packet)
-            self.schedule_event(Event(self.current_time, TRANS, node, packet))
+        elif packet.current_hop + 1 < len(packet.path):
+            if not self.is_congested(node):
+                self.enqueue_packet(node, packet)
+                if not self.node_busy[node]:
+                    self.node_busy[node] = True
+                    self.schedule_event(Event(self.current_time, TRANS, node, None))
+            else:
+                self.Ncong += 1
+                self.Ndrop += 1
 
     def get_results(self):
-        r_all = self.Nsucc / (self.Nsucc + self.Ndrop) if (self.Nsucc + self.Ndrop) > 0 else 0
-        p_cong = self.Ncong / (self.Ncong + self.Ngood + self.Nfail) if (self.Ncong + self.Ngood + self.Nfail) > 0 else 0
+        r_all = self.Nsucc / (self.Nsucc + self.Ndrop) if (self.Nsucc + self.Ndrop) else 0
+        p_cong = self.Ncong / (self.Ngood + self.Nfail + self.Ncong) if (self.Ngood + self.Nfail + self.Ncong) else 0
         return r_all, p_cong
 
 def create_network():
@@ -184,25 +213,20 @@ def create_network():
     G.add_edge("A", "C", weight=2)
     return G
 
-def run_multiple_lambdas():
+def run_simulation():
     ct = int(input("Enter congestion threshold (CT): "))
-    G_base = create_network()
-
+    G = create_network()
     lam = 0.1
     while lam <= 1.0:
-        G = G_base.copy()
         with tqdm(total=SIMULATION_LIMIT, desc=f"Lambda {lam:.2f}") as pbar:
-            sim = NetworkSimulator(G, lam, ct, pbar)
+            sim = NetworkSimulator(G.copy(), lam, ct, pbar)
             sim.initialize()
             sim.process_events()
-            r_all, p_cong = sim.get_results()
-
-        print(f"Lambda: {lam:.2f}, R_all: {r_all:.4f}, P_cong: {p_cong:.4f}")
-
-        if r_all < 0.1:
+            r, p = sim.get_results()
+        print(f"Lambda: {lam:.2f}, R_all: {r:.4f}, P_cong: {p:.4f}, Nsucc+Ndrop: {sim.Nsucc + sim.Ndrop}")
+        if r < 0.1:
             print("Network is effectively deadlocked.")
             break
-
         lam = round(lam + 0.1, 2)
 
-run_multiple_lambdas()
+run_simulation()
