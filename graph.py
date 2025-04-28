@@ -17,7 +17,7 @@ def plot_simulation_results(
     Otherwise plots all rows.
     """
     df = pd.read_csv(csv_file)
-    # Only filter by Run if column exists and run_id provided
+
     if run_id is not None and "Run" in df.columns:
         df = df[df["Run"] == run_id]
 
@@ -40,14 +40,13 @@ def plot_simulation_results(
         plt.savefig(output_file)
     plt.show()
 
-# Example usage for table11_5node2.csv:
 plot_simulation_results(
-    csv_file="table11_5node2.csv",
+    csv_file="table11_sim3.csv",
     run_id=None,             
     x_col="h",              
     y_col="R_all",           
-    xticks=[0.02,0.05,0.07,0.10,0.12,0.13],
-    yticks=[0.917,0.918,0.919,0.920],
-    title="Simulation3 Model-2 (on 5-node) - R_all vs h",
-    output_file="sim3_model2_Rall_vs_h.png"
+    xticks=[0.02,0.05,0.07,0.10,0.12,0.13,0.14],
+    yticks=[0.9880,0.9873, 0.9881,0.9882,0.9874,0.9881,0.9873],
+    title="Simulation3(Flood Routing) 5-Node Model Two",
+    output_file="sim3_5nodeModelTwo.png"
 )
