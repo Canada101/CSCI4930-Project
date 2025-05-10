@@ -3,3 +3,6 @@ The goal of this project is to recreate the network congestion experiment perfor
 Requirements to run
 **python**
 **networkx**
+**pandas**
+**tqdm**
+In order to attain results with the program run your desired simulation using python prog(number). The results of the simulation will print to the terminal. To graph the data ensure that the file in line 4 of graph.py matches the file created by the simulation and run graph.py for a visualization of the data.
